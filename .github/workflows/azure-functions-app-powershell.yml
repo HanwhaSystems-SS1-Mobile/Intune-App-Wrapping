@@ -1,0 +1,74 @@
+name: Wrap APK with Intune (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_path:
+        description: 'Path to input APK inside the repo (e.g. input/app-release.apk)'
+        required: true
+        default: 'input/app-release.apk'
+
+jobs:
+  wrap:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Intune App Wrapping Tool (latest release)
+        shell: pwsh
+        run: |
+          $repo = 'microsoftconnect/intune-app-wrapping-tool-android'
+          $release = Invoke-RestMethod -Headers @{'User-Agent'='github-actions'} "https://api.github.com/repos/$repo/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -First 1
+          Write-Host "Downloading $($asset.name)"
+          Invoke-WebRequest -Headers @{'User-Agent'='github-actions'} -Uri $asset.browser_download_url -OutFile 'tool.zip'
+          Expand-Archive -Path 'tool.zip' -DestinationPath './IntuneTool'
+
+      - name: Wrap APK with Intune (run tool)
+        shell: pwsh
+        env:
+          INPUT_APK: ${{ github.event.inputs.apk_path }}
+        run: |
+          if (-not (Test-Path $env:INPUT_APK)) { throw "Input APK not found: $env:INPUT_APK" }
+          # PowerShell module - 사용 가능한 경우:
+          Import-Module .\IntuneTool\IntuneAppWrappingTool.psm1 -ErrorAction SilentlyContinue
+          if (Get-Command -Name Invoke-AppWrappingTool -ErrorAction SilentlyContinue) {
+            Invoke-AppWrappingTool -InputPath $env:INPUT_APK -OutputPath .\app-wrapped.apk -Verbose
+          } else {
+            # 직접 exe 실행 (버전/배포에 따라 exe 이름이 달라질 수 있음)
+            .\IntuneTool\IntuneAppWrappingTool.exe -i $env:INPUT_APK -o .\app-wrapped.apk
+          }
+
+      - name: (옵션) Install Android SDK tools (zipalign/apksigner)
+        shell: pwsh
+        run: |
+          choco install -y android-sdk
+          $env:ANDROID_SDK_ROOT = "$env:ProgramFiles\Android\android-sdk"
+          & "$env:ANDROID_SDK_ROOT\tools\bin\sdkmanager.bat" "platform-tools" "build-tools;33.0.2" --sdk_root="$env:ANDROID_SDK_ROOT"
+
+      - name: (옵션) Restore keystore (from Secrets) and zipalign + sign
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        shell: pwsh
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes('keystore.jks', [Convert]::FromBase64String($env:KEYSTORE_BASE64))
+          $bt = Get-ChildItem "$env:ProgramFiles\Android\android-sdk\build-tools" | Sort-Object Name -Descending | Select-Object -First 1
+          $zipalign = Join-Path $bt "zipalign.exe"
+          $apksigner = Join-Path $bt "apksigner.bat"
+          & $zipalign -v 4 .\app-wrapped.apk .\app-aligned.apk
+          & $apksigner sign --ks keystore.jks --ks-key-alias $env:KEY_ALIAS --ks-pass pass:$env:KEYSTORE_PASSWORD --key-pass pass:$env:KEY_PASSWORD .\app-aligned.apk
+          Rename-Item .\app-aligned.apk app-wrapped-signed.apk
+
+      - name: Upload wrapped APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapped-apk
+          path: |
+            app-wrapped.apk
+            app-wrapped-signed.apk
